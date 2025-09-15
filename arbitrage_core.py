@@ -1,10 +1,18 @@
 """
-arbitrage_core.py (v5.2 — Amazon login required)
-- Always logs in to Amazon via Playwright headless Chromium, then browses Best Sellers & category pages.
-- Requires env: AMAZON_EMAIL, AMAZON_PASSWORD; optional AMAZON_TOTP_SECRET for 2FA (authenticator app).
-- eBay side remains HTML-only and does NOT require login.
-- Requests engine is still used where appropriate (eBay), Amazon fetches always use the logged-in browser session.
+arbitrage_core.py (v5.3 — Amazon login with Playwright **Firefox**)
+- Always logs in to Amazon (headless Playwright Firefox) and fetches Best Seller pages while authenticated.
+- eBay is scraped with plain requests (no login).
+- Use this for comparative analysis only (no posting/automation).
+
+Env (required):
+  AMAZON_EMAIL, AMAZON_PASSWORD
+  AMAZON_TOTP_SECRET  (optional, for authenticator-app 2FA)
+
+Render env (recommended):
+  PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright
+  PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
 """
+
 import os, random, re, time, urllib.parse
 from typing import List, Optional, Set
 from dataclasses import dataclass
@@ -12,14 +20,16 @@ from dataclasses import dataclass
 import requests
 from bs4 import BeautifulSoup
 
+# ------------------ Constants ------------------
 AMAZON_BASE = "https://www.amazon.co.uk"
 AMAZON_BEST_ROOT = "https://www.amazon.co.uk/gp/bestsellers"
 EBAY_SEARCH_URL = "https://www.ebay.co.uk/sch/i.html"
 
 HEADERS_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # modern, realistic UAs
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13.6; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 
 DELAY_MIN = float(os.environ.get("SCRAPER_DELAY_MIN", 1.0))
@@ -29,15 +39,15 @@ BACKOFF_BASE = float(os.environ.get("SCRAPER_BACKOFF_BASE", 2.0))
 
 AMAZON_EMAIL = os.environ.get("AMAZON_EMAIL")
 AMAZON_PASSWORD = os.environ.get("AMAZON_PASSWORD")
-AMAZON_TOTP_SECRET = os.environ.get("AMAZON_TOTP_SECRET")  # optional (for authenticator-based 2FA)
+AMAZON_TOTP_SECRET = os.environ.get("AMAZON_TOTP_SECRET")  # optional (for authenticator 2FA)
 
-def sleep_polite(a: float = DEAY_MIN if 'DEAY_MIN' in globals() else DELAY_MIN, b: float = DELAY_MAX):
+def sleep_polite(a: float = DELAY_MIN, b: float = DELAY_MAX):
     time.sleep(random.uniform(a, b))
 
 class FetchError(Exception):
     pass
 
-# ---------------- Requests engine (used for eBay) ----------------
+# ---------------- Requests (for eBay/public) ----------------
 def _requests_get(url: str) -> requests.Response:
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -49,10 +59,6 @@ def _requests_get(url: str) -> requests.Response:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Upgrade-Insecure-Requests": "1",
             "DNT": "1",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
         }
         try:
             resp = requests.get(url, headers=headers, timeout=30)
@@ -69,7 +75,7 @@ def _requests_get(url: str) -> requests.Response:
             time.sleep(BACKOFF_BASE * attempt)
     raise FetchError(f"Requests failed: {url} :: {last_exc}")
 
-# ---------------- Playwright engine + mandatory Amazon login ----------------
+# ---------------- Playwright (Firefox) + mandatory Amazon login ----------------
 _play_p = None
 _play_browser = None
 _play_ctx = None
@@ -77,6 +83,7 @@ _play_page = None
 _logged_in = False
 
 def _ensure_playwright():
+    """Start Playwright Firefox context with UK locale/timezone."""
     global _play_p, _play_browser, _play_ctx, _play_page
     if _play_ctx and _play_page:
         return _play_ctx, _play_page
@@ -87,11 +94,14 @@ def _ensure_playwright():
     height = random.choice([720, 800, 900, 1080])
 
     _play_p = sync_playwright().start()
-    _play_browser = _play_p.chromium.launch(headless=True, args=[
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-        "--disable-blink-features=AutomationControlled",
-    ])
+    # ---- FIREFOX here (not Chromium) ----
+    _play_browser = _play_p.firefox.launch(
+        headless=True,
+        args=[
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+        ],
+    )
     _play_ctx = _play_browser.new_context(
         user_agent=ua,
         locale="en-GB",
@@ -110,6 +120,7 @@ def _ensure_playwright():
     return _play_ctx, _play_page
 
 def _amazon_login():
+    """Headless login to Amazon. Requires AMAZON_EMAIL/PASSWORD; supports TOTP 2FA if provided."""
     global _logged_in
     if _logged_in:
         return
@@ -117,20 +128,19 @@ def _amazon_login():
         raise FetchError("AMAZON_EMAIL and AMAZON_PASSWORD must be set for mandatory Amazon login.")
 
     ctx, page = _ensure_playwright()
-    # Go to sign-in
     page.goto("https://www.amazon.co.uk/ap/signin", wait_until="domcontentloaded", timeout=60000)
+
     page.locator("input#ap_email").fill(AMAZON_EMAIL)
     page.locator("input#continue").click()
-
     page.wait_for_selector("input#ap_password", timeout=20000)
     page.locator("input#ap_password").fill(AMAZON_PASSWORD)
     page.locator("input#signInSubmit").click()
 
-    # Handle TOTP if asked
+    # If authenticator-based 2FA is enabled
     try:
         if page.locator("input#auth-mfa-otpcode").count():
             if not AMAZON_TOTP_SECRET:
-                raise FetchError("Amazon requested OTP but AMAZON_TOTP_SECRET is not set (use an authenticator app secret).")
+                raise FetchError("Amazon requested OTP but AMAZON_TOTP_SECRET is not set (use authenticator-app TOTP).")
             import pyotp
             otp = pyotp.TOTP(AMAZON_TOTP_SECRET).now()
             page.locator("input#auth-mfa-otpcode").fill(otp)
@@ -141,7 +151,6 @@ def _amazon_login():
         # If no OTP field appears, continue
         pass
 
-    # Quick sanity: open homepage; if sign-in link still present with a prompt, we may be out
     page.goto(AMAZON_BASE, wait_until="domcontentloaded", timeout=45000)
     _logged_in = True
 
@@ -154,9 +163,9 @@ def _playwright_get_html_as_logged_in(url: str) -> str:
 
 def get(url: str):
     """
-    Unified getter:
-    - For Amazon domains: ALWAYS use logged-in Playwright session.
-    - For non-Amazon (eBay): use requests engine with retries.
+    Unified fetch:
+    - Amazon:* -> logged-in Playwright Firefox session.
+    - Others (eBay): requests with retries.
     Returns an object with .text attribute.
     """
     class Resp:
@@ -165,9 +174,9 @@ def get(url: str):
     if "amazon.co.uk" in url or "amazon.com" in url:
         html = _playwright_get_html_as_logged_in(url)
         return Resp(html)
-    # eBay / others
     return _requests_get(url)
 
+# ---------------- Parsing helpers ----------------
 _price_re = re.compile(r"£\s*([0-9]+(?:[\.,][0-9]{1,2})?)")
 def parse_price_gbp(text: str) -> Optional[float]:
     if not text:
@@ -192,6 +201,7 @@ def safe_float(text: str) -> Optional[float]:
     except:
         return None
 
+# ---------------- Data models ----------------
 @dataclass
 class AmazonProduct:
     title: str
@@ -231,6 +241,7 @@ class OpportunityRow:
     image_url: Optional[str]
     sold_recent: int
 
+# ---------------- Amazon scraping ----------------
 DEFAULT_SEED_CATEGORIES = [
     f"{AMAZON_BEST_ROOT}/electronics",
     f"{AMAZON_BEST_ROOT}/kitchen",
@@ -326,7 +337,7 @@ def scrape_amazon_bestsellers(category_url: str, max_items: int = 50) -> List[Am
     for pg in [1, 2, 3]:
         url = category_url + ("&" if "?" in category_url else "?") + f"pg={pg}"
         sleep_polite()
-        resp = get(url)  # logged-in Playwright for Amazon
+        resp = get(url)  # logged-in Playwright Firefox
         soup = BeautifulSoup(resp.text, "html.parser")
         cards = soup.select("div.zg-grid-general-faceout, div._cDEzb_grid-cell_1uMOS") or soup.select("div.a-section.a-spacing-none.aok-relative")
         for c in cards:
@@ -337,7 +348,7 @@ def scrape_amazon_bestsellers(category_url: str, max_items: int = 50) -> List[Am
                     return out
     return out
 
-# ---------- eBay HTML (no login) ----------
+# ---------------- eBay scraping (public) ----------------
 def scrape_ebay_best_price(query: str, max_results: int = 8) -> Optional['EbayResult']:
     params = {"_nkw": query, "LH_BIN": "1", "LH_PrefLoc": "1", "LH_ItemCondition": "1000", "rt": "nc", "_sop": "15"}
     url = EBAY_SEARCH_URL + "?" + urllib.parse.urlencode(params)
@@ -385,6 +396,7 @@ def ebay_sold_count_html(query: str, max_scan: int = 20) -> int:
                 pass
     return total_sold
 
+# ---------------- Profit calc & orchestrator ----------------
 def estimate_profit(amazon_price: Optional[float], ebay_price: Optional[float], ebay_shipping: float,
                     fee_rate: float, fixed_fee: float):
     if amazon_price is None or ebay_price is None:
@@ -394,26 +406,6 @@ def estimate_profit(amazon_price: Optional[float], ebay_price: Optional[float], 
     profit = ebay_total_price - amazon_price - fee
     margin = profit / ebay_total_price if ebay_total_price else None
     return ebay_total_price, fee, profit if margin is not None else (None, None, None)
-
-@dataclass
-class OpportunityRow:
-    title: str
-    amazon_price: Optional[float]
-    ebay_price: Optional[float]
-    ebay_shipping: float
-    ebay_total_price: Optional[float]
-    estimated_ebay_fee: Optional[float]
-    est_profit_gbp: Optional[float]
-    est_margin: Optional[float]
-    prime: bool
-    rating: Optional[float]
-    reviews: Optional[int]
-    amazon_url: str
-    ebay_url: str
-    asin: Optional[str]
-    category_url: str
-    image_url: Optional[str]
-    sold_recent: int
 
 def find_opportunities(categories: List[str],
                        min_profit: float = 3.0,
