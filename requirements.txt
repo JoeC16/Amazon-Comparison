@@ -2,5 +2,6 @@ streamlit
 requests
 beautifulsoup4
 pandas
+playwright
 playwright-stealth
 pyotp
