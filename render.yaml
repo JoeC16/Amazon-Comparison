@@ -6,9 +6,11 @@ services:
     buildCommand: |
       pip install --upgrade pip
       pip install --no-cache-dir -r requirements.txt
-      pip install --no-cache-dir "playwright==1.45.1"
-      python -m playwright install chromium
-    startCommand: streamlit run app_streamlit.py --server.port $PORT --server.address 0.0.0.0
+    startCommand: |
+      export PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright
+      export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1
+      python -m playwright install chromium || true
+      streamlit run app_streamlit.py --server.port $PORT --server.address 0.0.0.0
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
